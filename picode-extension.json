@@ -1,0 +1,26 @@
+{
+  "id": "1password",
+  "name": "1Password",
+  "version": "0.1.0",
+  "apiVersion": 18,
+  "publisher": "cognixws",
+  "description": "Resolve the keys your agents ask for from your 1Password vaults, at the moment they run. Connect a service account scoped to the vaults you want to share.",
+  "icon": "icon.svg",
+  "vaultSource": true,
+  "permissions": [
+    "vaults:publish"
+  ],
+  "process": {
+    "command": "./bin/picode-1password",
+    "args": []
+  },
+  "settings": [
+    {
+      "key": "service_account_token",
+      "label": "Service account token",
+      "type": "secret",
+      "required": true,
+      "description": "Create it in 1Password → Developer → Service accounts, scoped to only the vaults you want to share. The token stays sealed here and is never shown again."
+    }
+  ]
+}

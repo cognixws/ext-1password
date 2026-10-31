@@ -1,0 +1,11 @@
+{
+  "refs": {
+    "op://Dev/API keys/Stripe": "sk-test-fake-9",
+    "op://Dev/API keys/Fal": "fal-fake-1",
+    "op://Team/Web/GitHub token": "ghp-fake-3"
+  },
+  "items": [
+    {"ref": "op://Dev/API keys/password", "label": "API keys", "vault": "Dev"},
+    {"ref": "op://Team/Web/password", "label": "Web", "vault": "Team"}
+  ]
+}
