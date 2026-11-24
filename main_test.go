@@ -238,8 +238,73 @@ func TestHostClientForFallsBackToSystemRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, file := range map[string]string{"unset": "", "missing": filepath.Join(t.TempDir(), "none.pem"), "junk": junk} {
-		if hostClientFor(file) != http.DefaultClient {
-			t.Fatalf("%s: want the system-roots client", name)
+		c := hostClientFor(file)
+		if c == http.DefaultClient || c.Timeout == 0 {
+			t.Fatalf("%s: want a system-roots client with a timeout, got %+v", name, c)
 		}
+	}
+}
+
+// tlsHost serves handler over TLS and returns the host and a client that
+// trusts it through a CA file, the way the supervisor hands one over.
+func tlsHost(t *testing.T, handler http.HandlerFunc) (host, *http.Client) {
+	t.Helper()
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+	caFile := filepath.Join(t.TempDir(), "root.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return host{url: srv.URL, token: "ext-token"}, hostClientFor(caFile)
+}
+
+func TestSettingTokenIgnoresTypedValues(t *testing.T) {
+	h, c := tlsHost(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"values":{"poll":30,"verbose":true},"secrets":{"service_account_token":"ops_abc"},"retired":{}}`))
+	})
+	if got, err := settingToken(c, h); err != nil || got != "ops_abc" {
+		t.Fatalf("got %q, %v; want ops_abc", got, err)
+	}
+}
+
+func TestSettingTokenSaysUnreadableSecrets(t *testing.T) {
+	h, c := tlsHost(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"values":{},"secrets":{},"retired":{},"secretsUnreadable":true,"problem":"enter them again"}`))
+	})
+	got, err := settingToken(c, h)
+	if err == nil || got != "" || !strings.Contains(err.Error(), "enter them again") {
+		t.Fatalf("got %q, %v; want an error carrying the host's problem", got, err)
+	}
+}
+
+func TestPublishItemsTrustsTheHostCA(t *testing.T) {
+	var got struct{ Items []sourceItem }
+	h, c := tlsHost(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/ext/v1/vaults/items" || r.Header.Get("X-PiCode-Extension-Token") != "ext-token" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+	})
+	items := []sourceItem{{Ref: "op://Dev/Stripe/key", Label: "Stripe", Vault: "Dev"}}
+	if err := publishItems(http.DefaultClient, h, items); err == nil {
+		t.Fatal("a client without the host CA must fail")
+	}
+	if err := publishItems(c, h, items); err != nil || len(got.Items) != 1 || got.Items[0].Label != "Stripe" {
+		t.Fatalf("publish: %v, host got %+v", err, got)
+	}
+}
+
+// A failed listing is not "published": the loop must try again next round.
+func TestPublishOnceReportsEachFailure(t *testing.T) {
+	h, c := tlsHost(t, func(w http.ResponseWriter, _ *http.Request) {})
+	if err := publishOnce(c, h, func() ([]sourceItem, error) { return nil, errors.New("1Password is down") }); err == nil {
+		t.Fatal("a failed listing must be an error")
+	}
+	if err := publishOnce(http.DefaultClient, h, func() ([]sourceItem, error) { return nil, nil }); err == nil {
+		t.Fatal("a failed publish must be an error")
+	}
+	if err := publishOnce(c, h, func() ([]sourceItem, error) { return nil, nil }); err != nil {
+		t.Fatal(err)
 	}
 }

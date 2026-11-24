@@ -84,13 +84,14 @@ var hostClient = sync.OnceValue(func() *http.Client {
 // one it falls back to the system roots, which is right for a host behind
 // a public certificate.
 func hostClientFor(caFile string) *http.Client {
+	systemRoots := &http.Client{Timeout: hostTimeout}
 	if caFile == "" {
-		return http.DefaultClient
+		return systemRoots
 	}
 	pem, err := os.ReadFile(caFile)
 	if err != nil {
 		log.Printf("host CA %s: %v; using the system roots", caFile, err)
-		return http.DefaultClient
+		return systemRoots
 	}
 	roots, err := x509.SystemCertPool()
 	if err != nil || roots == nil {
@@ -98,10 +99,14 @@ func hostClientFor(caFile string) *http.Client {
 	}
 	if !roots.AppendCertsFromPEM(pem) {
 		log.Printf("host CA %s: no certificate in it; using the system roots", caFile)
-		return http.DefaultClient
+		return systemRoots
 	}
-	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: 15 * time.Second}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: hostTimeout}
 }
+
+// hostTimeout bounds every Host API call, so a host that accepts and never
+// answers cannot stall the publish loop.
+const hostTimeout = 15 * time.Second
 
 func main() {
 	log.SetFlags(0)
@@ -237,28 +242,37 @@ type publisher interface {
 }
 
 // publishItems hands the host the names only, through the publish door.
-func publishItems(h host, items []sourceItem) {
+func publishItems(c *http.Client, h host, items []sourceItem) error {
 	if len(items) > 500 {
 		items = items[:500]
 	}
 	body, _ := json.Marshal(map[string]any{"items": items})
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.url+"/api/ext/v1/vaults/items", strings.NewReader(string(body)))
 	if err != nil {
-		return
+		return err
 	}
 	req.Header.Set("X-PiCode-Extension-Token", h.token)
 	req.Header.Set("Content-Type", "application/json")
-	res, err := hostClient().Do(req)
+	res, err := c.Do(req)
 	if err != nil {
-		log.Printf("publish: %v", err)
-		return
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		log.Printf("publish: %d", res.StatusCode)
-		return
+		return fmt.Errorf("the host answered %s", res.Status)
 	}
 	log.Printf("published %d item names", len(items))
+	return nil
+}
+
+// publishOnce lists what the service account can see and publishes the
+// names; any failure is returned, so the loop tries again next round.
+func publishOnce(c *http.Client, h host, list func() ([]sourceItem, error)) error {
+	items, err := list()
+	if err != nil {
+		return err
+	}
+	return publishItems(c, h, items)
 }
 
 type host struct {
@@ -283,14 +297,10 @@ func (o *onepasswordVendor) publishLoop(h host) {
 		if token != "" && token != seen {
 			if err := o.connect(token); err != nil {
 				log.Printf("connect: %v", err)
+			} else if err := publishOnce(hostClient(), h, func() ([]sourceItem, error) { return o.items(context.Background()) }); err != nil {
+				log.Printf("publish: %v", err)
 			} else {
 				seen = token
-				items, err := o.items(context.Background())
-				if err != nil {
-					log.Printf("publish: %v", err)
-					continue
-				}
-				publishItems(h, items)
 			}
 		}
 		time.Sleep(30 * time.Second)
@@ -313,13 +323,18 @@ func settingToken(c *http.Client, h host) (string, error) {
 	if res.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("the host answered %s", res.Status)
 	}
+	// Secrets ride "secrets"; plain settings ride "values", which this
+	// process does not read (they may hold any JSON type).
 	var out struct {
-		// Secrets ride "secrets"; plain settings ride "values".
-		Secrets map[string]string `json:"secrets"`
-		Values  map[string]string `json:"values"`
+		Secrets           map[string]string `json:"secrets"`
+		SecretsUnreadable bool              `json:"secretsUnreadable"`
+		Problem           string            `json:"problem"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("the host's settings did not decode: %w", err)
+	}
+	if out.SecretsUnreadable {
+		return "", fmt.Errorf("the host could not read the saved token: %s", out.Problem)
 	}
 	return out.Secrets["service_account_token"], nil
 }
@@ -353,7 +368,7 @@ func (o *onepasswordVendor) connect(token string) error {
 	defer cancel()
 	client, err := onepassword.NewClient(ctx,
 		onepassword.WithServiceAccountToken(token),
-		onepassword.WithIntegrationInfo("COGNIX[WS]", "0.1.0"),
+		onepassword.WithIntegrationInfo("COGNIX[WS]", "0.1.1"),
 	)
 	if err != nil {
 		return &resolveError{class: errRevoked, detail: clip(err.Error())}
@@ -498,7 +513,9 @@ func (f *fakeVendor) items(_ context.Context) ([]sourceItem, error) { return f.i
 // of the real vendor, so the QA tab behaves like production.
 func (f *fakeVendor) publishLoop(h host) {
 	for {
-		publishItems(h, f.itemList)
+		if err := publishItems(hostClient(), h, f.itemList); err != nil {
+			log.Printf("publish: %v", err)
+		}
 		time.Sleep(30 * time.Second)
 	}
 }

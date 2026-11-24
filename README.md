@@ -21,8 +21,10 @@ at launch by asking this process over loopback; the value rides the same
   10s), the metadata publish through `POST /api/ext/v1/vaults/items`
   (names only, 500 cap), the token read from its sealed setting. Every
   call to `PICODE_URL` goes through one client that trusts
-  `PICODE_CA_FILE`; a client without it fails each handshake and the
-  host logs `tls: bad certificate` every 30 s.
+  `PICODE_CA_FILE` on top of the system roots (only the system roots
+  when the file is unset or unreadable, which the process log says). A
+  client without that CA failed each handshake on a local-CA host,
+  which then logged `tls: bad certificate` every 30 s (fixed in 0.1.1).
 - `qa/package/` — the QA build: resolves from `qa/fixture.json` and only
   starts with `EXT_QA_MODE=1`. Never install it where real work runs.
 
