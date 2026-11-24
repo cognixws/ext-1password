@@ -1,7 +1,7 @@
 {
   "id": "1password",
   "name": "1Password",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "apiVersion": 18,
   "publisher": "cognixws",
   "description": "QA build: resolves from qa/fixture.json instead of 1Password.",

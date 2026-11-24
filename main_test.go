@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -193,5 +195,51 @@ func TestFakeModeRefusedWithoutQA(t *testing.T) {
 	}
 	if os.Getenv("EXT_1PASSWORD_FAKE") != "" {
 		t.Fatal("EXT_1PASSWORD_FAKE must not be set outside QA")
+	}
+}
+
+// TestSettingTokenTrustsTheHostCA reproduces the handshake failure the host
+// logged every 30s ("remote error: tls: bad certificate"): the settings read
+// went out on a client that does not trust the daemon's own authority. The
+// host client built from PICODE_CA_FILE verifies and reads the sealed token.
+func TestSettingTokenTrustsTheHostCA(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/ext/v1/settings" || r.Header.Get("X-PiCode-Extension-Token") != "ext-token" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"values":{},"secrets":{"service_account_token":"ops_abc"},"retired":{}}`))
+	}))
+	defer srv.Close()
+	h := host{url: srv.URL, token: "ext-token"}
+
+	caFile := filepath.Join(t.TempDir(), "root.pem")
+	der := srv.Certificate().Raw
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := settingToken(http.DefaultClient, h); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("a client without the host CA must fail the handshake, got %v", err)
+	}
+	got, err := settingToken(hostClientFor(caFile), h)
+	if err != nil || got != "ops_abc" {
+		t.Fatalf("host client: got %q, %v; want ops_abc", got, err)
+	}
+	if got, err := settingToken(hostClientFor(caFile), host{url: srv.URL, token: "wrong"}); err == nil || got != "" {
+		t.Fatalf("a refused read must be an error with no token, got %q, %v", got, err)
+	}
+}
+
+func TestHostClientForFallsBackToSystemRoots(t *testing.T) {
+	junk := filepath.Join(t.TempDir(), "junk.pem")
+	if err := os.WriteFile(junk, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, file := range map[string]string{"unset": "", "missing": filepath.Join(t.TempDir(), "none.pem"), "junk": junk} {
+		if hostClientFor(file) != http.DefaultClient {
+			t.Fatalf("%s: want the system-roots client", name)
+		}
 	}
 }

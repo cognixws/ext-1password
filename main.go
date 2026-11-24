@@ -8,6 +8,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,6 +70,37 @@ type sourceItem struct {
 	Ref   string `json:"ref"`
 	Label string `json:"label"`
 	Vault string `json:"vault"`
+}
+
+// hostClient is the one client for every call to PICODE_URL. It trusts the
+// daemon's own certificate authority (PICODE_CA_FILE) on top of the system
+// roots; a client without it fails every handshake with "bad certificate".
+// Built once, so its idle connections are reused instead of leaked.
+var hostClient = sync.OnceValue(func() *http.Client {
+	return hostClientFor(os.Getenv("PICODE_CA_FILE"))
+})
+
+// hostClientFor builds the host client for one CA file; without a readable
+// one it falls back to the system roots, which is right for a host behind
+// a public certificate.
+func hostClientFor(caFile string) *http.Client {
+	if caFile == "" {
+		return http.DefaultClient
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		log.Printf("host CA %s: %v; using the system roots", caFile, err)
+		return http.DefaultClient
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	if !roots.AppendCertsFromPEM(pem) {
+		log.Printf("host CA %s: no certificate in it; using the system roots", caFile)
+		return http.DefaultClient
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: 15 * time.Second}
 }
 
 func main() {
@@ -215,7 +248,7 @@ func publishItems(h host, items []sourceItem) {
 	}
 	req.Header.Set("X-PiCode-Extension-Token", h.token)
 	req.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := hostClient().Do(req)
 	if err != nil {
 		log.Printf("publish: %v", err)
 		return
@@ -236,9 +269,17 @@ type host struct {
 // settings the host keeps sealed, and when it changed, list what the
 // service account can see and publish names only.
 func (o *onepasswordVendor) publishLoop(h host) {
-	seen := ""
+	seen, lastErr := "", ""
 	for {
-		token := o.settingToken(h)
+		token, err := settingToken(hostClient(), h)
+		// Say a failure once, and again only when it changes, so a host
+		// the process cannot reach is visible without a line every 30s.
+		if msg := errText(err); msg != lastErr {
+			if msg != "" {
+				log.Printf("settings: %s", msg)
+			}
+			lastErr = msg
+		}
 		if token != "" && token != seen {
 			if err := o.connect(token); err != nil {
 				log.Printf("connect: %v", err)
@@ -258,28 +299,36 @@ func (o *onepasswordVendor) publishLoop(h host) {
 
 // settingToken reads its one secret setting back from the host. The value
 // stays in this process's memory.
-func (o *onepasswordVendor) settingToken(h host) string {
+func settingToken(c *http.Client, h host) (string, error) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, h.url+"/api/ext/v1/settings", nil)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	req.Header.Set("X-PiCode-Extension-Token", h.token)
-	res, err := http.DefaultClient.Do(req)
+	res, err := c.Do(req)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return ""
+		return "", fmt.Errorf("the host answered %s", res.Status)
 	}
 	var out struct {
-		Settings map[string]any `json:"settings"`
+		// Secrets ride "secrets"; plain settings ride "values".
+		Secrets map[string]string `json:"secrets"`
+		Values  map[string]string `json:"values"`
 	}
-	if json.NewDecoder(res.Body).Decode(&out) != nil {
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("the host's settings did not decode: %w", err)
+	}
+	return out.Secrets["service_account_token"], nil
+}
+
+func errText(err error) string {
+	if err == nil {
 		return ""
 	}
-	t, _ := out.Settings["service_account_token"].(string)
-	return t
+	return err.Error()
 }
 
 // onepasswordVendor is the real vendor behind the official SDK.
